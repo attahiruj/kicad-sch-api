@@ -10,10 +10,34 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from ..geometry.font_metrics import (
+    DEFAULT_PIN_LENGTH,
+    DEFAULT_PIN_NAME_OFFSET,
+    DEFAULT_PIN_NUMBER_SIZE,
+    DEFAULT_PIN_TEXT_WIDTH_RATIO,
+    DEFAULT_TEXT_HEIGHT,
+)
 from ..library.cache import get_symbol_cache
+from ..utils.text_effects import parse_effects_from_sexp
 from .types import Point, SchematicSymbol
 
 logger = logging.getLogger(__name__)
+
+
+def _sym_value(item) -> Optional[str]:
+    """
+    Get the string value of a parsed S-expression symbol.
+
+    sexpdata.Symbol.value is a bound method in some installed versions of
+    sexpdata and a plain string attribute in others. Comparing the bound
+    method directly to a string (e.g. `item.value == "pin_names"`) silently
+    always evaluates to False, so callers must go through this helper
+    instead of touching `.value` directly.
+    """
+    value = getattr(item, "value", None)
+    if value is None:
+        return None
+    return value() if callable(value) else value
 
 
 @dataclass
@@ -60,7 +84,10 @@ class BoundingBox:
         )
 
     def __repr__(self) -> str:
-        return f"BoundingBox(min_x={self.min_x:.2f}, min_y={self.min_y:.2f}, max_x={self.max_x:.2f}, max_y={self.max_y:.2f})"
+        return (
+            f"BoundingBox(min_x={self.min_x:.2f}, min_y={self.min_y:.2f}, "
+            f"max_x={self.max_x:.2f}, max_y={self.max_y:.2f})"
+        )
 
 
 class SymbolBoundingBoxCalculator:
@@ -71,12 +98,12 @@ class SymbolBoundingBoxCalculator:
     with kicad-sch-api's symbol cache system.
     """
 
-    # KiCAD default dimensions (from circuit-synth)
-    DEFAULT_TEXT_HEIGHT = 2.54  # 100 mils
-    DEFAULT_PIN_LENGTH = 2.54  # 100 mils
-    DEFAULT_PIN_NAME_OFFSET = 0.508  # 20 mils
-    DEFAULT_PIN_NUMBER_SIZE = 1.27  # 50 mils
-    DEFAULT_PIN_TEXT_WIDTH_RATIO = 2.0  # Width to height ratio for pin text
+    # KiCAD default dimensions (imported from font_metrics for consistency)
+    DEFAULT_TEXT_HEIGHT = DEFAULT_TEXT_HEIGHT  # 2.54mm (100 mils)
+    DEFAULT_PIN_LENGTH = DEFAULT_PIN_LENGTH  # 2.54mm (100 mils)
+    DEFAULT_PIN_NAME_OFFSET = DEFAULT_PIN_NAME_OFFSET  # 0.508mm (20 mils)
+    DEFAULT_PIN_NUMBER_SIZE = DEFAULT_PIN_NUMBER_SIZE  # 1.27mm (50 mils)
+    DEFAULT_PIN_TEXT_WIDTH_RATIO = DEFAULT_PIN_TEXT_WIDTH_RATIO  # 0.65 (proportional font)
 
     @classmethod
     def calculate_bounding_box(cls, symbol, include_properties: bool = True) -> BoundingBox:
@@ -99,9 +126,23 @@ class SymbolBoundingBoxCalculator:
         max_x = float("-inf")
         max_y = float("-inf")
 
-        # Process pins
+        # Extract font metrics and visibility from symbol definition (once per symbol)
+        pin_name_font_height, pin_name_font_width = cls._get_pin_name_font_size(symbol)
+        pin_names_hidden = cls._check_pin_names_hidden(symbol)
+
+        logger.debug(
+            f"Symbol {symbol.lib_id}: font=({pin_name_font_height}, "
+            f"{pin_name_font_width}), hidden={pin_names_hidden}"
+        )
+
+        # Process pins with actual font metrics
         for pin in symbol.pins:
-            pin_bounds = cls._get_pin_bounds(pin)
+            pin_bounds = cls._get_pin_bounds(
+                pin,
+                pin_names_hidden=pin_names_hidden,
+                font_height=pin_name_font_height,
+                font_width=pin_name_font_width,
+            )
             if pin_bounds:
                 p_min_x, p_min_y, p_max_x, p_max_y = pin_bounds
                 min_x = min(min_x, p_min_x)
@@ -151,8 +192,25 @@ class SymbolBoundingBoxCalculator:
         return BoundingBox(min_x, min_y, max_x, max_y)
 
     @classmethod
-    def _get_pin_bounds(cls, pin) -> Optional[Tuple[float, float, float, float]]:
-        """Calculate pin bounds including labels."""
+    def _get_pin_bounds(
+        cls,
+        pin,
+        pin_names_hidden: bool = False,
+        font_height: float = 1.27,
+        font_width: float | None = None,
+    ) -> tuple[float, float, float, float] | None:
+        """
+        Calculate pin bounds including labels using actual font metrics.
+
+        Args:
+            pin: SchematicPin object
+            pin_names_hidden: If True, skip pin name width calculation
+            font_height: Pin name font height in mm (from symbol definition)
+            font_width: Pin name font width in mm (None = proportional)
+
+        Returns:
+            Tuple of (min_x, min_y, max_x, max_y) or None
+        """
         x, y = pin.position.x, pin.position.y
         length = getattr(pin, "length", cls.DEFAULT_PIN_LENGTH)
         rotation = getattr(pin, "rotation", 0)
@@ -168,10 +226,11 @@ class SymbolBoundingBoxCalculator:
         max_x = max(x, end_x)
         max_y = max(y, end_y)
 
-        # Add space for pin name
+        # Add space for pin name (only if not hidden)
         pin_name = getattr(pin, "name", "")
-        if pin_name and pin_name != "~":
-            name_width = len(pin_name) * cls.DEFAULT_TEXT_HEIGHT * cls.DEFAULT_PIN_TEXT_WIDTH_RATIO
+        if not pin_names_hidden and pin_name and pin_name != "~":
+            # Calculate text width using actual font metrics
+            name_width = cls._calculate_text_width(pin_name, font_height, font_width)
 
             # Adjust bounds based on pin orientation
             if rotation == 0:  # Right
@@ -206,7 +265,7 @@ class SymbolBoundingBoxCalculator:
         for item in raw_data[1:]:  # Skip symbol name
             if isinstance(item, list) and len(item) > 0:
                 # Check for symbol unit definitions like "R_0_1"
-                if hasattr(item[0], "value") and item[0].value == "symbol":
+                if _sym_value(item[0]) == "symbol":
                     bounds_list.extend(cls._extract_unit_graphics_bounds(item))
 
         return bounds_list
@@ -217,8 +276,8 @@ class SymbolBoundingBoxCalculator:
         bounds_list = []
 
         for item in unit_data[1:]:  # Skip unit name
-            if isinstance(item, list) and len(item) > 0 and hasattr(item[0], "value"):
-                element_type = item[0].value
+            if isinstance(item, list) and len(item) > 0:
+                element_type = _sym_value(item[0])
 
                 if element_type == "rectangle":
                     bounds = cls._extract_rectangle_bounds(item)
@@ -248,9 +307,10 @@ class SymbolBoundingBoxCalculator:
 
             for item in rect_data[1:]:
                 if isinstance(item, list) and len(item) >= 3:
-                    if hasattr(item[0], "value") and item[0].value == "start":
+                    tag = _sym_value(item[0])
+                    if tag == "start":
                         start_point = (float(item[1]), float(item[2]))
-                    elif hasattr(item[0], "value") and item[0].value == "end":
+                    elif tag == "end":
                         end_point = (float(item[1]), float(item[2]))
 
             if start_point and end_point:
@@ -274,10 +334,10 @@ class SymbolBoundingBoxCalculator:
 
             for item in circle_data[1:]:
                 if isinstance(item, list) and len(item) >= 3:
-                    if hasattr(item[0], "value") and item[0].value == "center":
+                    if _sym_value(item[0]) == "center":
                         center = (float(item[1]), float(item[2]))
                 elif isinstance(item, list) and len(item) >= 2:
-                    if hasattr(item[0], "value") and item[0].value == "radius":
+                    if _sym_value(item[0]) == "radius":
                         radius = float(item[1])
 
             if center and radius > 0:
@@ -297,10 +357,10 @@ class SymbolBoundingBoxCalculator:
         try:
             for item in poly_data[1:]:
                 if isinstance(item, list) and len(item) > 0:
-                    if hasattr(item[0], "value") and item[0].value == "pts":
+                    if _sym_value(item[0]) == "pts":
                         for pt_item in item[1:]:
                             if isinstance(pt_item, list) and len(pt_item) >= 3:
-                                if hasattr(pt_item[0], "value") and pt_item[0].value == "xy":
+                                if _sym_value(pt_item[0]) == "xy":
                                     coordinates.append((float(pt_item[1]), float(pt_item[2])))
 
             if coordinates:
@@ -325,13 +385,13 @@ class SymbolBoundingBoxCalculator:
 
             for item in arc_data[1:]:
                 if isinstance(item, list) and len(item) >= 3:
-                    if hasattr(item[0], "value"):
-                        if item[0].value == "start":
-                            start = (float(item[1]), float(item[2]))
-                        elif item[0].value == "mid":
-                            mid = (float(item[1]), float(item[2]))
-                        elif item[0].value == "end":
-                            end = (float(item[1]), float(item[2]))
+                    tag = _sym_value(item[0])
+                    if tag == "start":
+                        start = (float(item[1]), float(item[2]))
+                    elif tag == "mid":
+                        mid = (float(item[1]), float(item[2]))
+                    elif tag == "end":
+                        end = (float(item[1]), float(item[2]))
 
             if start and end:
                 # Simple approach: use bounding box of start/mid/end points
@@ -349,6 +409,115 @@ class SymbolBoundingBoxCalculator:
             logger.warning(f"Error parsing arc: {e}")
 
         return None
+
+    @classmethod
+    def _get_pin_name_font_size(cls, symbol) -> tuple[float, float]:
+        """
+        Extract pin name font size from symbol definition.
+
+        Parses (effects (font (size height width))) from pin name definitions.
+        Falls back to defaults if not found.
+
+        Args:
+            symbol: SymbolDefinition with raw_kicad_data
+
+        Returns:
+            Tuple of (height, width) in mm, defaults to (1.27, 1.27)
+        """
+        if not hasattr(symbol, "raw_kicad_data") or not symbol.raw_kicad_data:
+            return (1.27, 1.27)  # KiCad default
+
+        # Search for pin definitions with name effects
+        def search_pin_name_font(data, depth=0):
+            if depth > 5 or not isinstance(data, list):
+                return None
+
+            for item in data:
+                if isinstance(item, list) and len(item) > 0:
+                    # Check if this is a pin definition
+                    if _sym_value(item[0]) == "pin":
+                        # Look for name with effects
+                        for sub in item:
+                            if isinstance(sub, list) and len(sub) > 0:
+                                if _sym_value(sub[0]) == "name":
+                                    # Parse effects from name section
+                                    effects = parse_effects_from_sexp(sub)
+                                    if effects and "font_size" in effects:
+                                        h, w = effects["font_size"]
+                                        logger.debug(f"Extracted pin name font: ({h}, {w})")
+                                        return (h, w)
+
+                    # Recurse
+                    result = search_pin_name_font(item, depth + 1)
+                    if result:
+                        return result
+
+            return None
+
+        font_size = search_pin_name_font(symbol.raw_kicad_data)
+        return font_size if font_size else (1.27, 1.27)
+
+    @classmethod
+    def _calculate_text_width(
+        cls, text: str, font_height: float, font_width: float | None = None
+    ) -> float:
+        """
+        Calculate text width using actual font metrics.
+
+        Args:
+            text: Text string
+            font_height: Font height in mm
+            font_width: Font width in mm (if None, uses proportional calculation)
+
+        Returns:
+            Total text width in mm
+        """
+        if font_width and font_width != font_height:
+            # Use explicit width if different from height
+            return len(text) * font_width
+        else:
+            # Use proportional font calculation (0.65 ratio)
+            return len(text) * font_height * cls.DEFAULT_PIN_TEXT_WIDTH_RATIO
+
+    @classmethod
+    def _check_pin_names_hidden(cls, symbol) -> bool:
+        """
+        Check if pin names are hidden in symbol definition.
+
+        Parses the (pin_names (hide yes)) directive from raw KiCAD data.
+        Symbol data structure:
+            [Symbol('pin_names'),
+             [Symbol('offset'), X],
+             [Symbol('hide'), Symbol('yes')]]
+
+        Args:
+            symbol: SymbolDefinition with raw_kicad_data
+
+        Returns:
+            True if pin names should be hidden, False otherwise
+        """
+        if not hasattr(symbol, "raw_kicad_data") or not symbol.raw_kicad_data:
+            return False
+
+        if not isinstance(symbol.raw_kicad_data, list):
+            return False
+
+        # Search for (pin_names ...) directive
+        for item in symbol.raw_kicad_data[1:]:  # Skip symbol name
+            if isinstance(item, list) and len(item) > 0:
+                # Check if this is a pin_names directive
+                if _sym_value(item[0]) == "pin_names":
+                    # Check for (hide yes) within pin_names
+                    for sub_item in item[1:]:
+                        if isinstance(sub_item, list) and len(sub_item) >= 2:
+                            if (
+                                _sym_value(sub_item[0]) == "hide"
+                                and _sym_value(sub_item[1]) == "yes"
+                            ):
+                                logger.debug(f"Pin names hidden for {symbol.lib_id}")
+                                return True
+
+        return False
 
 
 def get_component_bounding_box(
