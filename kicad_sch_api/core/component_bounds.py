@@ -129,10 +129,12 @@ class SymbolBoundingBoxCalculator:
         # Extract font metrics and visibility from symbol definition (once per symbol)
         pin_name_font_height, pin_name_font_width = cls._get_pin_name_font_size(symbol)
         pin_names_hidden = cls._check_pin_names_hidden(symbol)
+        pin_numbers_hidden = cls._check_pin_numbers_hidden(symbol)
 
         logger.debug(
             f"Symbol {symbol.lib_id}: font=({pin_name_font_height}, "
-            f"{pin_name_font_width}), hidden={pin_names_hidden}"
+            f"{pin_name_font_width}), names_hidden={pin_names_hidden}, "
+            f"numbers_hidden={pin_numbers_hidden}"
         )
 
         # Process pins with actual font metrics
@@ -142,6 +144,7 @@ class SymbolBoundingBoxCalculator:
                 pin_names_hidden=pin_names_hidden,
                 font_height=pin_name_font_height,
                 font_width=pin_name_font_width,
+                pin_numbers_hidden=pin_numbers_hidden,
             )
             if pin_bounds:
                 p_min_x, p_min_y, p_max_x, p_max_y = pin_bounds
@@ -198,6 +201,7 @@ class SymbolBoundingBoxCalculator:
         pin_names_hidden: bool = False,
         font_height: float = 1.27,
         font_width: float | None = None,
+        pin_numbers_hidden: bool = False,
     ) -> tuple[float, float, float, float] | None:
         """
         Calculate pin bounds including labels using actual font metrics.
@@ -207,6 +211,12 @@ class SymbolBoundingBoxCalculator:
             pin_names_hidden: If True, skip pin name width calculation
             font_height: Pin name font height in mm (from symbol definition)
             font_width: Pin name font width in mm (None = proportional)
+            pin_numbers_hidden: If True, skip the pin number margin - the
+                same class of bug as hidden pin names: a symbol can declare
+                `(pin_numbers (hide yes))` (true for Device:R, Device:C,
+                Device:Crystal, Switch:SW_Push, among others), in which case
+                KiCad never draws the pin number and no space should be
+                reserved for it.
 
         Returns:
             Tuple of (min_x, min_y, max_x, max_y) or None
@@ -242,9 +252,9 @@ class SymbolBoundingBoxCalculator:
             elif rotation == 270:  # Down
                 min_y = end_y - name_width
 
-        # Add margin for pin number
+        # Add margin for pin number (only if not hidden)
         pin_number = getattr(pin, "number", "")
-        if pin_number:
+        if pin_number and not pin_numbers_hidden:
             margin = cls.DEFAULT_PIN_NUMBER_SIZE * 1.5
             min_x -= margin
             min_y -= margin
@@ -480,21 +490,22 @@ class SymbolBoundingBoxCalculator:
             return len(text) * font_height * cls.DEFAULT_PIN_TEXT_WIDTH_RATIO
 
     @classmethod
-    def _check_pin_names_hidden(cls, symbol) -> bool:
+    def _check_symbol_level_hide(cls, symbol, directive: str) -> bool:
         """
-        Check if pin names are hidden in symbol definition.
+        Check a symbol-level `(<directive> ... (hide yes))` flag.
 
-        Parses the (pin_names (hide yes)) directive from raw KiCAD data.
-        Symbol data structure:
+        Both `(pin_names (hide yes))` and `(pin_numbers (hide yes))` share
+        this exact structure, e.g.:
             [Symbol('pin_names'),
              [Symbol('offset'), X],
              [Symbol('hide'), Symbol('yes')]]
 
         Args:
             symbol: SymbolDefinition with raw_kicad_data
+            directive: "pin_names" or "pin_numbers"
 
         Returns:
-            True if pin names should be hidden, False otherwise
+            True if the directive is present and sets hide to yes
         """
         if not hasattr(symbol, "raw_kicad_data") or not symbol.raw_kicad_data:
             return False
@@ -502,22 +513,35 @@ class SymbolBoundingBoxCalculator:
         if not isinstance(symbol.raw_kicad_data, list):
             return False
 
-        # Search for (pin_names ...) directive
         for item in symbol.raw_kicad_data[1:]:  # Skip symbol name
             if isinstance(item, list) and len(item) > 0:
-                # Check if this is a pin_names directive
-                if _sym_value(item[0]) == "pin_names":
-                    # Check for (hide yes) within pin_names
+                if _sym_value(item[0]) == directive:
                     for sub_item in item[1:]:
                         if isinstance(sub_item, list) and len(sub_item) >= 2:
                             if (
                                 _sym_value(sub_item[0]) == "hide"
                                 and _sym_value(sub_item[1]) == "yes"
                             ):
-                                logger.debug(f"Pin names hidden for {symbol.lib_id}")
+                                logger.debug(f"{directive} hidden for {symbol.lib_id}")
                                 return True
 
         return False
+
+    @classmethod
+    def _check_pin_names_hidden(cls, symbol) -> bool:
+        """Check if pin names are hidden via `(pin_names (hide yes))`."""
+        return cls._check_symbol_level_hide(symbol, "pin_names")
+
+    @classmethod
+    def _check_pin_numbers_hidden(cls, symbol) -> bool:
+        """
+        Check if pin numbers are hidden via `(pin_numbers (hide yes))`.
+
+        True for Device:R, Device:C, Device:Crystal, Switch:SW_Push, among
+        others - KiCad never draws a pin number for these, so no bounding
+        box margin should be reserved for one.
+        """
+        return cls._check_symbol_level_hide(symbol, "pin_numbers")
 
 
 def get_component_bounding_box(
